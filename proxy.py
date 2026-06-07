@@ -181,7 +181,7 @@ async def proxy_responses(request: Request):
     return JSONResponse(content=resp.json(), status_code=resp.status_code)
 
 
-async def _stream_forward(path: str, body: dict):
+async def _stream_forward(path: str, body: dict, headers: dict = None):
     """Pass the SSE byte stream from llama-server through verbatim.
 
     Using aiter_bytes() instead of aiter_lines() preserves the exact SSE
@@ -191,17 +191,92 @@ async def _stream_forward(path: str, body: dict):
     """
     t0 = time.time()
     bytes_sent = 0
+    effective_headers = headers or {"Content-Type": "application/json"}
     async with httpx.AsyncClient(timeout=300) as client:
         async with client.stream(
             "POST",
             f"{BACKEND_URL}{path}",
             json=body,
-            headers={"Content-Type": "application/json"},
+            headers=effective_headers,
         ) as resp:
             async for chunk in resp.aiter_bytes():
                 yield chunk
                 bytes_sent += len(chunk)
     log.info("  → stream done in %.1fs, %d bytes", time.time() - t0, bytes_sent)
+
+
+def normalize_chat_messages(messages: list) -> tuple[list, dict]:
+    """Strip volatile fields from OpenAI /v1/chat/completions messages array.
+
+    Each item is {"role": ..., "content": <str>}. Applied to system + user roles.
+    """
+    items = copy.deepcopy(messages)
+    stats = {"ts_removed": 0, "msg_ids_removed": 0, "items_modified": 0}
+    for msg in items:
+        role = msg.get("role")
+        content = msg.get("content")
+        if role in ("system", "developer", "user") and isinstance(content, str):
+            new_text, ts_n, mid_n = _strip_text(content)
+            if new_text != content:
+                msg["content"] = new_text
+                stats["ts_removed"] += ts_n
+                stats["msg_ids_removed"] += mid_n
+                stats["items_modified"] += 1
+    return items, stats
+
+
+def _forward_headers(request: Request) -> dict:
+    """Pass through auth + content-type. Drop host/length so httpx sets them."""
+    skip = {"host", "content-length", "connection", "accept-encoding"}
+    return {
+        k: v for k, v in request.headers.items()
+        if k.lower() not in skip
+    }
+
+
+@app.post("/v1/chat/completions")
+async def proxy_chat_completions(request: Request):
+    """Normalize then forward an OpenAI-compat chat-completions request."""
+    body = await request.json()
+    messages = body.get("messages", [])
+    normalized, stats = normalize_chat_messages(messages)
+    n_items = len(messages)
+    is_stream = body.get("stream", False)
+
+    log.info(
+        "POST /v1/chat/completions | items=%d | ts_removed=%d | msg_ids_removed=%d | "
+        "items_modified=%d | stream=%s",
+        n_items,
+        stats["ts_removed"],
+        stats["msg_ids_removed"],
+        stats["items_modified"],
+        is_stream,
+    )
+
+    if stats["ts_removed"] == 0 and stats["msg_ids_removed"] == 0:
+        log.warning("  → no volatile fields found; prompt sent as-is")
+
+    modified_body = {**body, "messages": normalized}
+    headers = _forward_headers(request)
+
+    if is_stream:
+        return StreamingResponse(
+            _stream_forward("/v1/chat/completions", modified_body, headers),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    async with httpx.AsyncClient(timeout=300) as client:
+        resp = await client.post(
+            f"{BACKEND_URL}/v1/chat/completions",
+            json=modified_body,
+            headers=headers,
+        )
+    try:
+        return JSONResponse(content=resp.json(), status_code=resp.status_code)
+    except Exception:
+        from fastapi.responses import PlainTextResponse
+        return PlainTextResponse(content=resp.text, status_code=resp.status_code)
 
 
 @app.get("/v1/models")
@@ -242,9 +317,7 @@ async def catch_all(full_path: str, request: Request):
             url=f"{BACKEND_URL}/{full_path}",
             json=body if isinstance(body, dict) else None,
             content=body.encode() if isinstance(body, str) else None,
-            headers={
-                "Content-Type": request.headers.get("content-type", "application/json")
-            },
+            headers=_forward_headers(request),
         )
 
     try:
